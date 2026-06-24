@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentview"
+version = "0.1.0"
+description = "Visualize AI agent step progress in the terminal"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = ["rich>=13"]
+
+[project.scripts]
+agentview = "agentview.cli:main"
+
+[project.urls]
+Repository = "https://github.com/yourname/agentview"
