@@ -171,14 +171,18 @@ def remove_hooks() -> None:
 
 
 def watch() -> None:
+    import threading
+    from collections import Counter
     from rich.live import Live
-    from agentview.claude_hook import POINTER_PATH, _load_state, _build_table, load_tasks
+    from agentview.claude_hook import POINTER_PATH, _load_state, _build_table, load_tasks, load_turns
 
     TASK_ICONS = {
         "completed":  "[bold green]✓[/bold green]",
         "in_progress": "[bold yellow]▶[/bold yellow]",
         "pending":    "[dim]○[/dim]",
     }
+
+    HINT = Text.from_markup("[dim][c] 設定   [r] 關聯   [q] 離開[/dim]")
 
     def _task_panel(tasks: list[dict]) -> object | None:
         if not tasks:
@@ -205,31 +209,128 @@ def watch() -> None:
             task_table.add_row(icon, subject)
         return Group(Text(""), Rule(style="dim"), header, task_table)
 
+    def _dim_table(steps: list[dict]) -> Table:
+        table = Table.grid(padding=(0, 2))
+        table.add_column(width=2)
+        table.add_column(min_width=16)
+        table.add_column(min_width=30)
+        table.add_column(width=8, justify="right")
+        for s in steps:
+            elapsed_str = f"[dim]{s['elapsed']:.1f}s[/dim]" if s.get("elapsed") is not None else ""
+            table.add_row(
+                "[dim]✓[/dim]" if s["status"] == "done" else "[dim]✗[/dim]",
+                f"[dim]{s['tool']}[/dim]",
+                f"[dim]{s.get('input_summary', '')}[/dim]",
+                elapsed_str,
+            )
+        return table
+
     def _renderable(state: dict | None, tasks: list[dict]) -> object:
-        if state is None and not tasks:
-            return Text.from_markup("[dim]Waiting for Claude Code session...[/dim]")
+        past_turns = load_turns(last_session_id) if last_session_id else []
+
+        if state is None and not tasks and not past_turns:
+            return Group(
+                Text.from_markup("[dim]Waiting for Claude Code session...[/dim]"),
+                Text(""),
+                HINT,
+            )
+
+        parts: list[object] = []
+
+        # Past turns — show last 2, dimmed
+        for i, turn_steps in enumerate(past_turns[-2:], start=max(1, len(past_turns) - 1)):
+            parts.append(Rule(f"[dim]Turn {i}[/dim]", style="dim"))
+            parts.append(_dim_table(turn_steps))
+
+        # Current turn
         if state is None:
-            parts: list[object] = [Text.from_markup("[dim]Waiting for next turn...[/dim]")]
-            task_panel = _task_panel(tasks)
-            if task_panel:
-                parts.append(task_panel)
-            return Group(*parts)
-        elapsed = time.time() - state["started_at"]
-        header = Text.from_markup(
-            f"[bold cyan]Claude Code Session[/bold cyan]  [dim]{elapsed:.0f}s elapsed[/dim]"
-        )
-        parts = [header]
-        if state["steps"]:
-            parts += [Text(""), _build_table(state["steps"])]
+            if past_turns:
+                parts.append(Rule("[dim]等待下一個 turn...[/dim]", style="dim"))
+            else:
+                parts.append(Text.from_markup("[dim]Waiting for next turn...[/dim]"))
         else:
-            parts.append(Text.from_markup("[dim]Starting...[/dim]"))
+            elapsed = time.time() - state["started_at"]
+            turn_label = f"Turn {len(past_turns) + 1}" if past_turns else "Claude Code Session"
+            parts.append(Rule(
+                f"[bold cyan]{turn_label}[/bold cyan]  [dim]{elapsed:.0f}s elapsed[/dim]",
+                style="dim",
+            ))
+
+            # Loop detection: (tool, file) pairs across all turns + current
+            all_steps = [s for t in past_turns for s in t] + state["steps"]
+            counts = Counter(
+                (s["tool"], s.get("input_summary", ""))
+                for s in all_steps
+                if s.get("input_summary")
+            )
+            for (tool, fname), n in counts.most_common():
+                if n < 3:
+                    break
+                parts.append(Text.from_markup(
+                    f"  [bold yellow]⚠[/bold yellow]  [dim]{tool} {fname} 已出現 {n} 次[/dim]"
+                ))
+
+            if state["steps"]:
+                parts.append(Text(""))
+                parts.append(_build_table(state["steps"]))
+            else:
+                parts.append(Text.from_markup("[dim]Starting...[/dim]"))
+
         task_panel = _task_panel(tasks)
         if task_panel:
             parts.append(task_panel)
+        parts += [Text(""), HINT]
         return Group(*parts)
 
+    flag: dict = {}
+
+    def _key_listener() -> None:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                while not flag.get("stop"):
+                    if msvcrt.kbhit():
+                        ch = msvcrt.getch().lower()
+                        if ch == b"c":
+                            flag["action"] = "config"
+                            return
+                        elif ch == b"r":
+                            flag["action"] = "relations"
+                            return
+                        elif ch == b"q":
+                            flag["action"] = "quit"
+                            return
+                    time.sleep(0.05)
+            else:
+                import select
+                import termios
+                import tty
+                fd = sys.stdin.fileno()
+                old = termios.tcgetattr(fd)
+                try:
+                    tty.setraw(fd)
+                    while not flag.get("stop"):
+                        r, _, _ = select.select([sys.stdin], [], [], 0.05)
+                        if r:
+                            ch = sys.stdin.read(1).lower()
+                            if ch == "c":
+                                flag["action"] = "config"
+                                return
+                            elif ch == "r":
+                                flag["action"] = "relations"
+                                return
+                            elif ch in ("q", "\x03"):
+                                flag["action"] = "quit"
+                                return
+                finally:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            pass
+
+    key_thread = threading.Thread(target=_key_listener, daemon=True)
+    key_thread.start()
+
     try:
-        # Seed last_session_id: prefer active POINTER_PATH, fall back to most-recent tasks dir
         last_session_id = ""
         try:
             if POINTER_PATH.exists():
@@ -243,29 +344,40 @@ def watch() -> None:
                 if dirs:
                     last_session_id = max(dirs, key=lambda x: x[1])[0].name
 
-        # Only block in spinner when there are no tasks to show yet
         if not last_session_id or not load_tasks(last_session_id):
             with console.status("[dim]Waiting for Claude Code session...[/dim]") as spinner:
-                while not POINTER_PATH.exists():
+                while not POINTER_PATH.exists() and not flag.get("action"):
                     time.sleep(0.25)
                 spinner.stop()
 
-        with Live(console=console, refresh_per_second=4) as live:
-            while True:
-                session_id = ""
-                try:
-                    if POINTER_PATH.exists():
-                        session_id = POINTER_PATH.read_text(encoding="utf-8").strip()
-                        last_session_id = session_id
-                except OSError:
-                    pass
-                state = _load_state(session_id) if session_id else None
-                tasks = load_tasks(last_session_id) if last_session_id else []
-                time.sleep(0.25)
-                live.update(_renderable(state, tasks))
+        if not flag.get("action"):
+            with Live(console=console, refresh_per_second=4) as live:
+                while not flag.get("action"):
+                    session_id = ""
+                    try:
+                        if POINTER_PATH.exists():
+                            session_id = POINTER_PATH.read_text(encoding="utf-8").strip()
+                            last_session_id = session_id
+                    except OSError:
+                        pass
+                    state = _load_state(session_id) if session_id else None
+                    tasks = load_tasks(last_session_id) if last_session_id else []
+                    time.sleep(0.25)
+                    live.update(_renderable(state, tasks))
 
     except KeyboardInterrupt:
-        pass
+        flag["action"] = "quit"
+    finally:
+        flag["stop"] = True
+
+    if flag.get("action") == "config":
+        console.print()
+        config_cmd()
+        watch()
+    elif flag.get("action") == "relations":
+        console.print()
+        relations_cmd()
+        watch()
 
 
 def _load_sessions() -> list[dict]:
@@ -530,6 +642,116 @@ def hook_test() -> None:
     console.print("\n[bold green]Hook test passed.[/bold green]")
 
 
+def relations_cmd() -> None:
+    from collections import Counter
+
+    sessions = _load_sessions()
+    if not sessions:
+        console.print("[dim]No sessions logged yet.[/dim]")
+        return
+
+    FILE_TOOLS = {"Read", "Edit", "Write", "NotebookEdit"}
+    read_counts: Counter = Counter()
+    edit_counts: Counter = Counter()
+    cooccur: Counter = Counter()
+
+    for sess in sessions:
+        session_reads: set[str] = set()
+        session_edits: set[str] = set()
+        for step in sess.get("steps", []):
+            tool = step.get("tool", "")
+            fname = step.get("input_summary", "")
+            if not fname or tool not in FILE_TOOLS:
+                continue
+            if tool == "Read":
+                read_counts[fname] += 1
+                session_reads.add(fname)
+            else:
+                edit_counts[fname] += 1
+                session_edits.add(fname)
+        files = sorted(session_reads | session_edits)
+        for i, a in enumerate(files):
+            for b in files[i + 1:]:
+                cooccur[(a, b)] += 1
+
+    n = len(sessions)
+    console.print(f"\n[bold]agentview relations[/bold]  [dim]({n} sessions)[/dim]\n")
+
+    top_pairs = cooccur.most_common(10)
+    if top_pairs:
+        console.print("[dim]共現分析 — 同一 session 出現的檔案對[/dim]\n")
+        bar_max = top_pairs[0][1]
+        for (a, b), count in top_pairs:
+            bar = "█" * int(count / bar_max * 20)
+            console.print(
+                f"  {a:<22} [dim]↔[/dim]  {b:<22}  "
+                f"[green]{bar:<20}[/green]  [dim]{count}/{n}[/dim]"
+            )
+    else:
+        console.print("[dim]尚無共現資料（需要多個檔案的 session）[/dim]")
+
+    all_files = set(read_counts) | set(edit_counts)
+    if all_files:
+        console.print("\n[dim]Read / Edit 比 — 存取次數最多的檔案[/dim]\n")
+        table = Table.grid(padding=(0, 2))
+        table.add_column(min_width=24)
+        table.add_column(width=5, justify="right")
+        table.add_column(width=5, justify="right")
+        table.add_column(width=7, justify="right")
+        table.add_column(min_width=10)
+
+        for fname in sorted(all_files, key=lambda f: read_counts[f] + edit_counts[f], reverse=True)[:15]:
+            r = read_counts[fname]
+            e = edit_counts[fname]
+            if e == 0:
+                ratio_str = "[dim]—[/dim]"
+                label = "[dim]唯讀[/dim]"
+            else:
+                ratio = r / e
+                ratio_str = f"[dim]{ratio:.1f}×[/dim]"
+                label = "[dim]主要參考[/dim]" if ratio > 5 else ("[yellow]頻繁修改[/yellow]" if ratio < 2 else "")
+            table.add_row(fname, f"[dim]R {r}[/dim]", f"[dim]E {e}[/dim]", ratio_str, label)
+
+        console.print(table)
+
+    console.print()
+
+
+def config_cmd() -> None:
+    from agentview.claude_hook import load_config, save_config
+
+    SETTINGS = [
+        ("show_sources", "Sources",       "顯示 WebFetch URL（每次 session 結束時）"),
+        ("toast",        "Toast 通知",    "Windows 桌面通知（session 結束時）"),
+    ]
+
+    cfg = load_config()
+
+    while True:
+        console.print("\n[bold]agentview 設定[/bold]\n")
+        for i, (key, label, desc) in enumerate(SETTINGS, 1):
+            state = "[bold green]開[/bold green]" if cfg[key] else "[dim]關[/dim]"
+            console.print(f"  {i}.  {label:<12} [{state}]   [dim]{desc}[/dim]")
+
+        console.print("\n切換選項輸入數字，[dim]s[/dim] 儲存，[dim]q[/dim] 離開：", end=" ")
+        try:
+            choice = input().strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            break
+
+        if choice == "q":
+            break
+        elif choice == "s":
+            save_config(cfg)
+            console.print("[bold green]✓[/bold green] 設定已儲存")
+            break
+        elif choice.isdigit() and 1 <= int(choice) <= len(SETTINGS):
+            key = SETTINGS[int(choice) - 1][0]
+            cfg[key] = not cfg[key]
+        else:
+            console.print("[dim]無效輸入[/dim]")
+
+
 def _count_log_lines(path: Path) -> int:
     try:
         return len(path.read_text(encoding="utf-8").splitlines())
@@ -549,6 +771,8 @@ def main() -> None:
     log_p.add_argument("--tool", metavar="NAME", help="Only show sessions containing this tool")
     sub.add_parser("stats", help="Usage statistics and recommendations")
     sub.add_parser("hook-test", help="Simulate a session to verify hook installation")
+    sub.add_parser("config", help="Interactive settings menu")
+    sub.add_parser("relations", help="File co-occurrence and Read/Edit ratio analysis")
     args = parser.parse_args()
 
     if args.command == "install-hooks":
@@ -565,6 +789,10 @@ def main() -> None:
         stats_cmd()
     elif args.command == "hook-test":
         hook_test()
+    elif args.command == "config":
+        config_cmd()
+    elif args.command == "relations":
+        relations_cmd()
     else:
         parser.print_help()
 

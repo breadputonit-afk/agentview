@@ -35,6 +35,27 @@ console = Console(stderr=True, highlight=False)
 POINTER_PATH = Path(tempfile.gettempdir()) / "agentview_current.txt"
 LOG_PATH = Path.home() / ".claude" / "agentview_log.jsonl"
 TASKS_DIR = Path.home() / ".claude" / "tasks"
+CONFIG_PATH = Path.home() / ".claude" / "agentview_config.json"
+
+_DEFAULT_CONFIG = {
+    "show_sources": True,
+    "toast": True,
+}
+
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            return {**_DEFAULT_CONFIG, **data}
+        except Exception:
+            pass
+    return dict(_DEFAULT_CONFIG)
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def _state_path(session_id: str) -> Path:
@@ -93,6 +114,30 @@ def _state_lock(session_id: str, timeout: float = 2.0):
                 pass
 
 
+def _turns_path(session_id: str) -> Path:
+    return Path(tempfile.gettempdir()) / f"agentview_turns_{session_id}.json"
+
+
+def load_turns(session_id: str) -> list[list[dict]]:
+    """Return completed turns for this session; each turn is a list of step dicts."""
+    path = _turns_path(session_id)
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return []
+
+
+def _append_turn(state: dict) -> None:
+    turns = load_turns(state["session_id"])
+    turns.append([{k: v for k, v in s.items() if k != "started_at"} for s in state["steps"]])
+    path = _turns_path(state["session_id"])
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(turns, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
 def _task_cache_path(session_id: str) -> Path:
     return Path(tempfile.gettempdir()) / f"agentview_tasks_{session_id}.json"
 
@@ -148,6 +193,14 @@ def load_tasks(session_id: str) -> list[dict]:
     return []
 
 
+def _web_source(tool_name: str, tool_input: dict) -> str | None:
+    if tool_name == "WebFetch":
+        return tool_input.get("url") or None
+    if tool_name == "WebSearch":
+        return tool_input.get("query") or None
+    return None
+
+
 def _input_summary(tool_name: str, tool_input: dict) -> str:
     if tool_name in ("Read", "Write", "Edit", "NotebookEdit"):
         p = tool_input.get("file_path", "")
@@ -199,13 +252,17 @@ def on_pre_tool_use(session_id: str, payload: dict) -> None:
     tool_input = payload.get("tool_input", {})
     with _state_lock(session_id):
         state = _load_state(session_id)
-        state["steps"].append({
+        step: dict = {
             "tool": tool_name,
             "input_summary": _input_summary(tool_name, tool_input),
             "status": "running",
             "started_at": time.time(),
             "elapsed": None,
-        })
+        }
+        src = _web_source(tool_name, tool_input)
+        if src:
+            step["source"] = src
+        state["steps"].append(step)
         _save_state(state)
     try:
         POINTER_PATH.write_text(session_id, encoding="utf-8")
@@ -296,14 +353,44 @@ def on_stop(state: dict) -> None:
             parts.append(f"[bold yellow]{interrupted} interrupted[/bold yellow]")
         parts.append(f"[dim]{total_time:.1f}s total[/dim]")
         console.print("  " + "  ·  ".join(parts))
+
+        cfg = load_config()
+        searches: list[str] = []
+        fetches: list[str] = []
+        seen: set[str] = set()
+        for s in state["steps"]:
+            src = s.get("source")
+            if not src or src in seen:
+                continue
+            seen.add(src)
+            if s["tool"] == "WebSearch":
+                searches.append(src)
+            elif s["tool"] == "WebFetch":
+                fetches.append(src)
+
+        if cfg["show_sources"] and (searches or fetches):
+            console.print()
+            console.print("  [dim]Sources[/dim]")
+            for q in searches:
+                console.print(f"  [dim]🔍  {q}[/dim]")
+            for url in fetches:
+                try:
+                    from urllib.parse import urlparse
+                    domain = urlparse(url).netloc or url
+                except Exception:
+                    domain = url
+                console.print(f"  🌐  [link={url}]{domain}[/link]")
+
         console.print()
 
         _append_log(state, total_time)
+        _append_turn(state)
 
-        toast_parts = [f"{len(state['steps'])} tools", f"{total_time:.1f}s"]
-        if failed:
-            toast_parts.append(f"{failed} failed")
-        _win_toast("Claude Code 完成", " · ".join(toast_parts))
+        if cfg["toast"]:
+            toast_parts = [f"{len(state['steps'])} tools", f"{total_time:.1f}s"]
+            if failed:
+                toast_parts.append(f"{failed} failed")
+            _win_toast("Claude Code 完成", " · ".join(toast_parts))
 
     _state_path(state["session_id"]).unlink(missing_ok=True)
     try:
