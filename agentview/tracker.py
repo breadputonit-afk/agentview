@@ -162,14 +162,28 @@ class Tracker:
         finally:
             self._session_active = False
 
+    def plan(self, names: list[str]) -> None:
+        for name in names:
+            if not any(s.name == name for s in self._steps):
+                self._steps.append(Step(name, _tracker=self))
+        self._ensure_live()
+        self._refresh()
+
     def step(self, name: str) -> "_StepProxy":
         return _StepProxy(self, name)
+
+    def _find_or_create(self, name: str) -> "Step":
+        for s in self._steps:
+            if s.name == name and s.status == "pending":
+                return s
+        s = Step(name, _tracker=self)
+        self._steps.append(s)
+        return s
 
     # ── sync internals ────────────────────────────────────────────────────
 
     def _run_step(self, name: str, func, args, kwargs):
-        s = Step(name, _tracker=self)
-        self._steps.append(s)
+        s = self._find_or_create(name)
         self._ensure_live()
         s.start()
         self._refresh()
@@ -189,8 +203,7 @@ class Tracker:
 
     @contextmanager
     def _context_step(self, name: str) -> Generator[Step, None, None]:
-        s = Step(name, _tracker=self)
-        self._steps.append(s)
+        s = self._find_or_create(name)
         self._ensure_live()
         s.start()
         self._refresh()
@@ -210,8 +223,7 @@ class Tracker:
     # ── async internals ───────────────────────────────────────────────────
 
     async def _async_run_step(self, name: str, func, args, kwargs):
-        s = Step(name, _tracker=self)
-        self._steps.append(s)
+        s = self._find_or_create(name)
         self._ensure_live()
         s.start()
         self._refresh()
@@ -231,8 +243,7 @@ class Tracker:
 
     @asynccontextmanager
     async def _async_context_step(self, name: str) -> AsyncGenerator[Step, None]:
-        s = Step(name, _tracker=self)
-        self._steps.append(s)
+        s = self._find_or_create(name)
         self._ensure_live()
         s.start()
         self._refresh()
