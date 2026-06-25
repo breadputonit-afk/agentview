@@ -323,7 +323,7 @@ def log_cmd(tail: int, tool_filter: str | None) -> None:
 
 
 def stats_cmd() -> None:
-    from collections import Counter
+    from collections import Counter, defaultdict
 
     sessions = _load_sessions()
     if not sessions:
@@ -363,6 +363,34 @@ def stats_cmd() -> None:
     for tool, count in top:
         bar_len = int(count / bar_max * 30)
         console.print(f"  {tool:<20} {'█' * bar_len:<30} [dim]{count}[/dim]")
+
+    tool_times: dict[str, list[float]] = defaultdict(list)
+    for s in all_steps:
+        if s.get("elapsed") is not None and s.get("status") == "done":
+            tool_times[s.get("tool", "?")].append(s["elapsed"])
+    if tool_times:
+        avg_times = sorted(
+            ((t, sum(v) / len(v)) for t, v in tool_times.items()),
+            key=lambda x: -x[1],
+        )[:8]
+        time_max = avg_times[0][1]
+        console.print("\n[dim]Slowest tools (avg)[/dim]")
+        for tool, avg in avg_times:
+            bar_len = int(avg / time_max * 30)
+            console.print(f"  {tool:<20} {'█' * bar_len:<30} [dim]{avg:.1f}s[/dim]")
+
+    if len(sessions) > 1:
+        hour_counts: Counter = Counter(
+            datetime.fromtimestamp(sess["started_at"]).hour for sess in sessions
+        )
+        hour_max = max(hour_counts.values())
+        console.print("\n[dim]Activity by hour[/dim]")
+        for h in range(24):
+            n = hour_counts.get(h, 0)
+            if n == 0:
+                continue
+            bar_len = int(n / hour_max * 20)
+            console.print(f"  {h:02d}  {'█' * bar_len} [dim]{n}[/dim]")
 
     # --- recommendations ---
     console.print("\n[bold]建議[/bold]")
