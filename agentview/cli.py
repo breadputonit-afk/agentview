@@ -392,6 +392,29 @@ def stats_cmd() -> None:
             bar_len = int(n / hour_max * 20)
             console.print(f"  {h:02d}  {'█' * bar_len} [dim]{n}[/dim]")
 
+    web_steps = [
+        s for s in all_steps
+        if s.get("tool") in ("WebSearch", "WebFetch") and s.get("input_summary")
+    ]
+    if web_steps:
+        search_counts: Counter = Counter(
+            s["input_summary"] for s in web_steps if s.get("tool") == "WebSearch"
+        )
+        fetch_counts: Counter = Counter(
+            s["input_summary"] for s in web_steps if s.get("tool") == "WebFetch"
+        )
+        console.print("\n[dim]Web lookups[/dim]")
+        if search_counts:
+            console.print("  [dim]WebSearch[/dim]")
+            for query, n in search_counts.most_common():
+                suffix = f" [dim]×{n}[/dim]" if n > 1 else ""
+                console.print(f"    {query}{suffix}")
+        if fetch_counts:
+            console.print("  [dim]WebFetch[/dim]")
+            for url, n in fetch_counts.most_common():
+                suffix = f" [dim]×{n}[/dim]" if n > 1 else ""
+                console.print(f"    {url}{suffix}")
+
     # --- recommendations ---
     console.print("\n[bold]建議[/bold]")
     hints: list[tuple[str, str]] = []  # (level, text)
