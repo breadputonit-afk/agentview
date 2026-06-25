@@ -74,6 +74,61 @@ def install_hooks() -> None:
         print("\nAll hooks already configured.")
 
 
+def update_hooks() -> None:
+    settings_path = Path.home() / ".claude" / "settings.json"
+
+    if not settings_path.exists():
+        print("~/.claude/settings.json not found. Run: agentview install-hooks")
+        sys.exit(1)
+
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(f"Error: {settings_path} is not valid JSON: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    python = sys.executable
+    base_cmd = f'"{python}" -m agentview.claude_hook'
+
+    hooks = settings.get("hooks", {})
+    updated: list[str] = []
+    missing: list[str] = []
+
+    for event in ("PreToolUse", "PostToolUse", "Stop", "SubagentStop"):
+        event_list = hooks.get(event, [])
+        found = False
+        for group in event_list:
+            for hook in group.get("hooks", []):
+                cmd = hook.get("command", "")
+                if "agentview" in cmd and "claude_hook" in cmd:
+                    new_cmd = f"{base_cmd} --event {event}"
+                    if cmd == new_cmd:
+                        print(f"  up-to-date  {event}")
+                    else:
+                        hook["command"] = new_cmd
+                        updated.append(event)
+                        print(f"  updated     {event}")
+                    found = True
+                    break
+            if found:
+                break
+        if not found:
+            missing.append(event)
+            print(f"  missing     {event}")
+
+    if missing:
+        print(f"\n⚠  {len(missing)} hook(s) not found — run: agentview install-hooks")
+
+    if updated:
+        settings_path.write_text(
+            json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        print(f"\nHooks updated → {settings_path}")
+        print("Restart Claude Code to activate.")
+    elif not missing:
+        print("\nAll hooks already up to date.")
+
+
 def remove_hooks() -> None:
     settings_path = Path.home() / ".claude" / "settings.json"
 
@@ -435,6 +490,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="agentview", description="agentview CLI")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("install-hooks", help="Add agentview hooks to ~/.claude/settings.json")
+    sub.add_parser("update-hooks", help="Update hook commands to current Python executable")
     sub.add_parser("remove-hooks", help="Remove agentview hooks from ~/.claude/settings.json")
     sub.add_parser("watch", help="Live view of the current Claude Code session")
     log_p = sub.add_parser("log", help="Show recent session history")
@@ -446,6 +502,8 @@ def main() -> None:
 
     if args.command == "install-hooks":
         install_hooks()
+    elif args.command == "update-hooks":
+        update_hooks()
     elif args.command == "remove-hooks":
         remove_hooks()
     elif args.command == "watch":
