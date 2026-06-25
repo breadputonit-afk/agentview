@@ -171,6 +171,7 @@ def remove_hooks() -> None:
 
 
 def watch() -> None:
+    import tempfile
     import threading
     from collections import Counter
     from rich.live import Live
@@ -182,19 +183,39 @@ def watch() -> None:
         "pending":    "[dim]○[/dim]",
     }
 
-    HINT = Text.from_markup("[dim][c] 設定   [r] 關聯   [q] 離開[/dim]")
+    HINT = Text.from_markup("[dim][c] 設定   [r] 關聯   [p] 套件   [q] 離開[/dim]")
 
-    def _task_panel(tasks: list[dict]) -> object | None:
+    _turns_cache: dict = {"session_id": "", "mtime": 0.0, "data": []}
+
+    def _load_turns_cached(session_id: str) -> list:
+        path = Path(tempfile.gettempdir()) / f"agentview_turns_{session_id}.json"
+        try:
+            mtime = path.stat().st_mtime if path.exists() else 0.0
+        except OSError:
+            mtime = 0.0
+        if session_id == _turns_cache["session_id"] and mtime == _turns_cache["mtime"]:
+            return _turns_cache["data"]
+        data = load_turns(session_id)
+        _turns_cache.update({"session_id": session_id, "mtime": mtime, "data": data})
+        return data
+
+    def _task_panel(tasks: list[dict], elapsed_session: float | None = None) -> object | None:
         if not tasks:
             return None
         done = sum(1 for t in tasks if t["status"] == "completed")
         total = len(tasks)
+        remaining = total - done
         pct = done / total if total else 0
         bar_filled = int(pct * 20)
         bar = "[bold green]" + "█" * bar_filled + "[/bold green]" + "[dim]" + "░" * (20 - bar_filled) + "[/dim]"
 
+        eta_str = ""
+        if elapsed_session and done > 0 and remaining > 0:
+            eta_secs = int(elapsed_session / done * remaining)
+            eta_str = f"  [dim]ETA ~{eta_secs}s[/dim]"
+
         header = Text.from_markup(
-            f"[bold]Tasks[/bold]  {bar}  [dim]{done}/{total}[/dim]"
+            f"[bold]Tasks[/bold]  {bar}  [dim]{done}/{total}[/dim]{eta_str}"
         )
         task_table = Table.grid(padding=(0, 1))
         task_table.add_column(width=2)
@@ -226,7 +247,7 @@ def watch() -> None:
         return table
 
     def _renderable(state: dict | None, tasks: list[dict]) -> object:
-        past_turns = load_turns(last_session_id) if last_session_id else []
+        past_turns = _load_turns_cached(last_session_id) if last_session_id else []
 
         if state is None and not tasks and not past_turns:
             return Group(
@@ -237,12 +258,10 @@ def watch() -> None:
 
         parts: list[object] = []
 
-        # Past turns — show last 2, dimmed
         for i, turn_steps in enumerate(past_turns[-2:], start=max(1, len(past_turns) - 1)):
             parts.append(Rule(f"[dim]Turn {i}[/dim]", style="dim"))
             parts.append(_dim_table(turn_steps))
 
-        # Current turn
         if state is None:
             if past_turns:
                 parts.append(Rule("[dim]等待下一個 turn...[/dim]", style="dim"))
@@ -256,7 +275,6 @@ def watch() -> None:
                 style="dim",
             ))
 
-            # Loop detection: (tool, file) pairs across all turns + current
             all_steps = [s for t in past_turns for s in t] + state["steps"]
             counts = Counter(
                 (s["tool"], s.get("input_summary", ""))
@@ -276,7 +294,8 @@ def watch() -> None:
             else:
                 parts.append(Text.from_markup("[dim]Starting...[/dim]"))
 
-        task_panel = _task_panel(tasks)
+        session_elapsed = (time.time() - state["started_at"]) if state else None
+        task_panel = _task_panel(tasks, elapsed_session=session_elapsed)
         if task_panel:
             parts.append(task_panel)
         parts += [Text(""), HINT]
@@ -296,6 +315,9 @@ def watch() -> None:
                             return
                         elif ch == b"r":
                             flag["action"] = "relations"
+                            return
+                        elif ch == b"p":
+                            flag["action"] = "packages"
                             return
                         elif ch == b"q":
                             flag["action"] = "quit"
@@ -319,6 +341,9 @@ def watch() -> None:
                             elif ch == "r":
                                 flag["action"] = "relations"
                                 return
+                            elif ch == "p":
+                                flag["action"] = "packages"
+                                return
                             elif ch in ("q", "\x03"):
                                 flag["action"] = "quit"
                                 return
@@ -327,57 +352,69 @@ def watch() -> None:
         except Exception:
             pass
 
-    key_thread = threading.Thread(target=_key_listener, daemon=True)
-    key_thread.start()
+    last_session_id = ""
 
-    try:
+    while True:
+        # Reset flag and start a fresh key listener thread each navigation cycle.
+        # key_thread.join() at the end of each iteration guarantees the old thread
+        # has exited (and restored terminal state on Unix) before the next starts.
+        flag.clear()
         last_session_id = ""
+        key_thread = threading.Thread(target=_key_listener, daemon=True)
+        key_thread.start()
+
         try:
-            if POINTER_PATH.exists():
-                last_session_id = POINTER_PATH.read_text(encoding="utf-8").strip()
-        except OSError:
-            pass
-        if not last_session_id:
-            task_base = Path.home() / ".claude" / "tasks"
-            if task_base.is_dir():
-                dirs = [(d, d.stat().st_mtime) for d in task_base.iterdir() if d.is_dir()]
-                if dirs:
-                    last_session_id = max(dirs, key=lambda x: x[1])[0].name
+            try:
+                if POINTER_PATH.exists():
+                    last_session_id = POINTER_PATH.read_text(encoding="utf-8").strip()
+            except OSError:
+                pass
+            if not last_session_id:
+                task_base = Path.home() / ".claude" / "tasks"
+                if task_base.is_dir():
+                    dirs = [(d, d.stat().st_mtime) for d in task_base.iterdir() if d.is_dir()]
+                    if dirs:
+                        last_session_id = max(dirs, key=lambda x: x[1])[0].name
 
-        if not last_session_id or not load_tasks(last_session_id):
-            with console.status("[dim]Waiting for Claude Code session...[/dim]") as spinner:
-                while not POINTER_PATH.exists() and not flag.get("action"):
-                    time.sleep(0.25)
-                spinner.stop()
+            if not last_session_id or not load_tasks(last_session_id):
+                with console.status("[dim]Waiting for Claude Code session...[/dim]") as spinner:
+                    while not POINTER_PATH.exists() and not flag.get("action"):
+                        time.sleep(0.25)
+                    spinner.stop()
 
-        if not flag.get("action"):
-            with Live(console=console, refresh_per_second=4) as live:
-                while not flag.get("action"):
-                    session_id = ""
-                    try:
-                        if POINTER_PATH.exists():
-                            session_id = POINTER_PATH.read_text(encoding="utf-8").strip()
-                            last_session_id = session_id
-                    except OSError:
-                        pass
-                    state = _load_state(session_id) if session_id else None
-                    tasks = load_tasks(last_session_id) if last_session_id else []
-                    time.sleep(0.25)
-                    live.update(_renderable(state, tasks))
+            if not flag.get("action"):
+                with Live(console=console, refresh_per_second=4) as live:
+                    while not flag.get("action"):
+                        session_id = ""
+                        try:
+                            if POINTER_PATH.exists():
+                                session_id = POINTER_PATH.read_text(encoding="utf-8").strip()
+                                last_session_id = session_id
+                        except OSError:
+                            pass
+                        state = _load_state(session_id) if session_id else None
+                        tasks = load_tasks(last_session_id) if last_session_id else []
+                        time.sleep(0.25)
+                        live.update(_renderable(state, tasks))
 
-    except KeyboardInterrupt:
-        flag["action"] = "quit"
-    finally:
-        flag["stop"] = True
+        except KeyboardInterrupt:
+            flag["action"] = "quit"
+        finally:
+            flag["stop"] = True
+            key_thread.join(timeout=0.5)
 
-    if flag.get("action") == "config":
-        console.print()
-        config_cmd()
-        watch()
-    elif flag.get("action") == "relations":
-        console.print()
-        relations_cmd()
-        watch()
+        action = flag.get("action")
+        if action == "quit":
+            break
+        elif action == "config":
+            console.print()
+            config_cmd()
+        elif action == "relations":
+            console.print()
+            relations_cmd()
+        elif action == "packages":
+            console.print()
+            packages_cmd(last_session_id)
 
 
 def _load_sessions() -> list[dict]:
@@ -642,6 +679,90 @@ def hook_test() -> None:
     console.print("\n[bold green]Hook test passed.[/bold green]")
 
 
+def _check_package(manager: str, pkg: str) -> tuple[bool | None, str]:
+    """Return (installed, version). installed=None means check failed."""
+    import subprocess
+    try:
+        if manager == "pip":
+            r = subprocess.run(
+                [sys.executable, "-m", "pip", "show", pkg],
+                capture_output=True, text=True, timeout=8,
+            )
+            if r.returncode == 0:
+                for line in r.stdout.splitlines():
+                    if line.startswith("Version:"):
+                        return True, line.split(":", 1)[1].strip()
+                return True, ""
+            return False, ""
+        if manager == "npm":
+            r = subprocess.run(
+                ["npm", "list", pkg, "--depth=0"],
+                capture_output=True, text=True, timeout=8,
+            )
+            return (pkg in r.stdout), ""
+        if manager == "winget":
+            r = subprocess.run(
+                ["winget", "list", "--name", pkg],
+                capture_output=True, text=True, timeout=15,
+            )
+            return (pkg.lower() in r.stdout.lower()), ""
+        if manager == "scoop":
+            r = subprocess.run(
+                ["scoop", "list", pkg],
+                capture_output=True, text=True, timeout=8,
+            )
+            return (pkg.lower() in r.stdout.lower()), ""
+        if manager == "conda":
+            r = subprocess.run(
+                ["conda", "list", pkg],
+                capture_output=True, text=True, timeout=10,
+            )
+            return (pkg.lower() in r.stdout.lower()), ""
+    except Exception:
+        pass
+    return None, ""
+
+
+def packages_cmd(session_id: str | None = None) -> None:
+    from agentview.claude_hook import load_packages, POINTER_PATH
+
+    if session_id is None:
+        try:
+            if POINTER_PATH.exists():
+                session_id = POINTER_PATH.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+
+    pkgs = load_packages(session_id) if session_id else []
+
+    if not pkgs:
+        console.print("\n[dim]本 session 尚未偵測到安裝指令。[/dim]")
+        console.print("[dim]（僅追蹤 pip / npm / winget / scoop / conda install）[/dim]\n")
+        return
+
+    console.print(f"\n[bold]📦 套件檢查[/bold]  [dim]({len(pkgs)} 個，檢查中...)[/dim]\n")
+
+    table = Table.grid(padding=(0, 2))
+    table.add_column(width=8)
+    table.add_column(min_width=22)
+    table.add_column()
+
+    for p in pkgs:
+        manager, pkg = p["manager"], p["package"]
+        installed, version = _check_package(manager, pkg)
+        if installed is None:
+            status = "[dim]? 未能檢查[/dim]"
+        elif installed:
+            ver = f" [dim]{version}[/dim]" if version else ""
+            status = f"[bold green]✓ 已安裝[/bold green]{ver}"
+        else:
+            status = "[bold red]✗ 未安裝[/bold red]"
+        table.add_row(f"[dim]{manager}[/dim]", pkg, status)
+
+    console.print(table)
+    console.print()
+
+
 def relations_cmd() -> None:
     from collections import Counter
 
@@ -773,6 +894,7 @@ def main() -> None:
     sub.add_parser("hook-test", help="Simulate a session to verify hook installation")
     sub.add_parser("config", help="Interactive settings menu")
     sub.add_parser("relations", help="File co-occurrence and Read/Edit ratio analysis")
+    sub.add_parser("packages", help="Check installation status of packages used this session")
     args = parser.parse_args()
 
     if args.command == "install-hooks":
@@ -793,6 +915,8 @@ def main() -> None:
         config_cmd()
     elif args.command == "relations":
         relations_cmd()
+    elif args.command == "packages":
+        packages_cmd()
     else:
         parser.print_help()
 

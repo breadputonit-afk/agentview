@@ -193,6 +193,79 @@ def load_tasks(session_id: str) -> list[dict]:
     return []
 
 
+def _packages_path(session_id: str) -> Path:
+    return Path(tempfile.gettempdir()) / f"agentview_packages_{session_id}.json"
+
+
+def _parse_install_cmd(command: str) -> list[tuple[str, str]]:
+    """Return (manager, package) pairs from an install command."""
+    import re
+    import shlex
+    results: list[tuple[str, str]] = []
+    cmd = command.strip()
+
+    patterns = [
+        (r"pip(?:3)?\s+install\s+(.*)", "pip"),
+        (r"conda\s+install\s+(.*)",     "conda"),
+        (r"npm\s+install\s+(.*)",       "npm"),
+        (r"scoop\s+install\s+(.*)",     "scoop"),
+        (r"winget\s+install\s+(.*)",    "winget"),
+    ]
+    for pattern, manager in patterns:
+        m = re.match(pattern, cmd, re.IGNORECASE)
+        if not m:
+            continue
+        try:
+            args = shlex.split(m.group(1))
+        except ValueError:
+            args = m.group(1).split()
+        skip_next = False
+        for arg in args:
+            if skip_next:
+                skip_next = False
+                continue
+            if arg in ("-r", "--requirement", "-c", "--constraint", "-e", "--editable"):
+                skip_next = True
+                continue
+            if arg.startswith("-"):
+                continue
+            if arg.endswith(".txt") or arg.endswith(".cfg"):
+                continue
+            pkg = re.split(r"[>=<!;\[]", arg)[0].strip()
+            if pkg and re.match(r'^[A-Za-z0-9][A-Za-z0-9._\-]*$', pkg):
+                results.append((manager, pkg))
+        return results
+    return results
+
+
+def _save_packages(session_id: str, pkgs: list[tuple[str, str]]) -> None:
+    path = _packages_path(session_id)
+    existing: list[dict] = []
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    seen = {(p["manager"], p["package"]) for p in existing}
+    for manager, package in pkgs:
+        if (manager, package) not in seen:
+            existing.append({"manager": manager, "package": package})
+            seen.add((manager, package))
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(existing, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def load_packages(session_id: str) -> list[dict]:
+    path = _packages_path(session_id)
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return []
+
+
 def _web_source(tool_name: str, tool_input: dict) -> str | None:
     if tool_name == "WebFetch":
         return tool_input.get("url") or None
@@ -264,6 +337,10 @@ def on_pre_tool_use(session_id: str, payload: dict) -> None:
             step["source"] = src
         state["steps"].append(step)
         _save_state(state)
+        if tool_name in ("Bash", "PowerShell"):
+            pkgs = _parse_install_cmd(tool_input.get("command", ""))
+            if pkgs:
+                _save_packages(session_id, pkgs)
     try:
         POINTER_PATH.write_text(session_id, encoding="utf-8")
     except Exception:
@@ -384,7 +461,10 @@ def on_stop(state: dict) -> None:
         console.print()
 
         _append_log(state, total_time)
-        _append_turn(state)
+        try:
+            _append_turn(state)
+        except Exception:
+            pass
 
         if cfg["toast"]:
             toast_parts = [f"{len(state['steps'])} tools", f"{total_time:.1f}s"]
