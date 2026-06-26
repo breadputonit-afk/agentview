@@ -16,4 +16,4 @@ dependencies = ["rich>=13"]
 agentview = "agentview.cli:main"
 
 [project.urls]
-Repository = "https://github.com/yourname/agentview"
+Repository = "https://github.com/breadputonit-afk/agentview"
